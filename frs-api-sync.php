@@ -3,7 +3,7 @@
  * Plugin Name: FRS API Sync
  * Plugin URI: https://base.frs.works
  * Description: Syncs loan officers from FRS API to WordPress Person CPT and links user accounts
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: FRS Team
  */
 
@@ -644,8 +644,8 @@ class FRS_API_Sync {
             'primary_business_email' => $agent['email'] ?? '',
             'phone_number' => $agent['phone'] ?? '',
             'job_title' => $agent['job_title'] ?? '',
-            'nmls_number' => $agent['nmls_number'] ?? '',  // Changed from 'nmls' to 'nmls_number'
-            'dre_license' => $agent['license_number'] ?? '', // Changed from 'dre' to 'dre_license'
+            'nmls' => $agent['nmls_number'] ?? '',  // NMLS field name from ACF
+            'license_number' => $agent['license_number'] ?? '', // DRE license field name from ACF
             'biography' => $agent['biography'] ?? '',
         );
         
