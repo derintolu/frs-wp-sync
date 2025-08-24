@@ -1,0 +1,27 @@
+# WordPress Plugin Development
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*~
+
+# Development
+node_modules/
+vendor/
+.env
+.env.local
+.vscode/
+.idea/
+
+# Build files
+*.zip
+*.tar.gz
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
