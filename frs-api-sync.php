@@ -3,7 +3,7 @@
  * Plugin Name: FRS API Sync
  * Plugin URI: https://base.frs.works
  * Description: Syncs loan officers from FRS API to WordPress Person CPT and links user accounts
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: FRS Team
  */
 
@@ -36,6 +36,8 @@ class FRS_API_Sync {
         add_action('wp_ajax_frs_get_sync_status', array($this, 'get_sync_status'));
         add_action('wp_ajax_frs_test_api_connection', array($this, 'test_api_connection'));
         add_action('wp_ajax_frs_setup_webhook', array($this, 'setup_webhook_with_api'));
+        add_action('wp_ajax_frs_reset_sync_timestamp', array($this, 'reset_sync_timestamp'));
+        add_action('wp_ajax_frs_cleanup_duplicate_photos', array($this, 'cleanup_duplicate_photos'));
         
         // REST API endpoint for webhooks
         add_action('rest_api_init', array($this, 'register_webhook_endpoints'));
@@ -59,6 +61,7 @@ class FRS_API_Sync {
         register_setting('frs_sync_settings', 'frs_api_token');
         register_setting('frs_sync_settings', 'frs_api_base_url'); 
         register_setting('frs_sync_settings', 'frs_auto_sync');
+        register_setting('frs_sync_settings', 'frs_sync_mode');
     }
     
     public function add_admin_menu() {
@@ -82,6 +85,7 @@ class FRS_API_Sync {
         $api_token = get_option('frs_api_token', '');
         $api_base_url = get_option('frs_api_base_url', 'https://base.frs.works/api');
         $auto_sync = get_option('frs_auto_sync', '1');
+        $sync_mode = get_option('frs_sync_mode', 'incremental');
         ?>
         <div class="wrap">
             <h1>FRS API Sync Settings</h1>
@@ -101,6 +105,16 @@ class FRS_API_Sync {
                         <td>
                             <input type="text" name="frs_api_token" value="<?php echo esc_attr($api_token); ?>" class="regular-text" />
                             <p class="description">Your FRS API authentication token (used for both API access and webhook verification)</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Sync Mode</th>
+                        <td>
+                            <select name="frs_sync_mode">
+                                <option value="incremental" <?php selected($sync_mode, 'incremental'); ?>>Incremental (Only Changed Records)</option>
+                                <option value="full" <?php selected($sync_mode, 'full'); ?>>Full (All Records)</option>
+                            </select>
+                            <p class="description">Incremental sync only fetches records modified since last sync, reducing load</p>
                         </td>
                     </tr>
                     <tr>
@@ -142,7 +156,9 @@ class FRS_API_Sync {
             <p>
                 <button type="button" id="test-api-connection" class="button">Test API Connection</button>
                 <button type="button" id="sync-loan-officers" class="button button-primary">Sync Loan Officers Now</button>
+                <button type="button" id="force-full-sync" class="button">Force Full Sync</button>
                 <button type="button" id="setup-webhook" class="button">Setup Webhook</button>
+                <button type="button" id="cleanup-duplicates" class="button">Cleanup Duplicate Photos</button>
             </p>
             
             <!-- Progress Bar -->
@@ -262,10 +278,14 @@ class FRS_API_Sync {
                 var $progressDetails = $('#sync-progress-details');
                 
                 $progressText.text('Sync completed successfully!');
-                $progressDetails.text(
-                    'Total processed: ' + data.processed + 
-                    (data.errors > 0 ? ' (Errors: ' + data.errors + ')' : '')
-                );
+                var detailsText = 'Total processed: ' + data.processed;
+                if (data.skipped > 0) {
+                    detailsText += ', Skipped unchanged: ' + data.skipped;
+                }
+                if (data.errors > 0) {
+                    detailsText += ' (Errors: ' + data.errors + ')';
+                }
+                $progressDetails.text(detailsText);
                 
                 $('#sync-results').html(
                     '<div class="notice notice-success"><p>✅ ' + data.message + '</p></div>'
@@ -296,6 +316,58 @@ class FRS_API_Sync {
             // Bind sync button
             $('#sync-loan-officers').on('click', function() {
                 performSync();
+            });
+            
+            // Force full sync button
+            $('#force-full-sync').on('click', function() {
+                if (confirm('This will sync ALL records from FRS, not just changes. Continue?')) {
+                    var $button = $(this);
+                    $button.prop('disabled', true).text('Starting full sync...');
+                    
+                    // Clear last sync time to force full sync
+                    $.ajax({
+                        url: frs_sync_ajax.ajax_url,
+                        type: 'POST',
+                        data: {
+                            action: 'frs_reset_sync_timestamp',
+                            nonce: frs_sync_ajax.nonce
+                        },
+                        success: function() {
+                            performSync();
+                            $button.prop('disabled', false).text('Force Full Sync');
+                        }
+                    });
+                }
+            });
+            
+            // Cleanup duplicate photos
+            $('#cleanup-duplicates').on('click', function() {
+                var $button = $(this);
+                $button.prop('disabled', true).text('Cleaning up...');
+                
+                $.ajax({
+                    url: frs_sync_ajax.ajax_url,
+                    type: 'POST',
+                    data: {
+                        action: 'frs_cleanup_duplicate_photos',
+                        nonce: frs_sync_ajax.nonce
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            $('#sync-results').html(
+                                '<div class="notice notice-success"><p>✅ ' + response.data + '</p></div>'
+                            );
+                            loadSyncStatus();
+                        } else {
+                            $('#sync-results').html(
+                                '<div class="notice notice-error"><p>❌ ' + response.data + '</p></div>'
+                            );
+                        }
+                    },
+                    complete: function() {
+                        $button.prop('disabled', false).text('Cleanup Duplicate Photos');
+                    }
+                });
             });
             
             // Setup webhook with FRS API
@@ -404,7 +476,23 @@ class FRS_API_Sync {
         check_ajax_referer('frs_sync_nonce', 'nonce');
         
         $last_sync = get_option('frs_last_sync_time');
+        $last_full_sync = get_option('frs_last_full_sync_time');
         $total_loan_officers = wp_count_posts('person')->publish ?? 0;
+        
+        // Count synced people (those with FRS agent ID)
+        $synced_people = get_posts(array(
+            'post_type' => 'person',
+            'meta_query' => array(
+                array(
+                    'key' => '_frs_agent_id',
+                    'compare' => 'EXISTS'
+                )
+            ),
+            'fields' => 'ids',
+            'posts_per_page' => -1
+        ));
+        
+        // Count linked users
         $linked_users = get_posts(array(
             'post_type' => 'person',
             'meta_query' => array(
@@ -417,10 +505,37 @@ class FRS_API_Sync {
             'posts_per_page' => -1
         ));
         
+        // Count people with photos
+        $people_with_photos = get_posts(array(
+            'post_type' => 'person',
+            'meta_query' => array(
+                array(
+                    'key' => 'headshot',
+                    'compare' => 'EXISTS'
+                )
+            ),
+            'fields' => 'ids',
+            'posts_per_page' => -1
+        ));
+        
+        // Get duplicate prevention stats
+        global $wpdb;
+        $duplicate_check = $wpdb->get_var("
+            SELECT COUNT(DISTINCT meta_value) 
+            FROM {$wpdb->postmeta} 
+            WHERE meta_key = '_frs_image_url_hash' 
+            AND meta_value != ''
+        ");
+        
         $status_html = '<table class="wp-list-table widefat fixed striped">';
         $status_html .= '<tr><td><strong>Total People:</strong></td><td>' . $total_loan_officers . '</td></tr>';
-        $status_html .= '<tr><td><strong>Linked Users:</strong></td><td>' . count($linked_users) . '</td></tr>';
+        $status_html .= '<tr><td><strong>Synced from FRS:</strong></td><td>' . count($synced_people) . '</td></tr>';
+        $status_html .= '<tr><td><strong>Linked to Users:</strong></td><td>' . count($linked_users) . '</td></tr>';
+        $status_html .= '<tr><td><strong>With Photos:</strong></td><td>' . count($people_with_photos) . '</td></tr>';
+        $status_html .= '<tr><td><strong>Unique Photos:</strong></td><td>' . ($duplicate_check ?: '0') . '</td></tr>';
         $status_html .= '<tr><td><strong>Last Sync:</strong></td><td>' . ($last_sync ? date('Y-m-d H:i:s', $last_sync) : 'Never') . '</td></tr>';
+        $status_html .= '<tr><td><strong>Last Full Sync:</strong></td><td>' . ($last_full_sync ? date('Y-m-d H:i:s', $last_full_sync) : 'Never') . '</td></tr>';
+        $status_html .= '<tr><td><strong>Sync Mode:</strong></td><td>' . ucfirst(get_option('frs_sync_mode', 'incremental')) . '</td></tr>';
         $status_html .= '</table>';
         
         wp_send_json_success($status_html);
@@ -462,6 +577,19 @@ class FRS_API_Sync {
             $progress_percent = $total_count > 0 ? min(100, round(($processed_count / $total_count) * 100)) : 100;
             $has_more = $processed_count < $total_count;
             
+            // Track completion of full sync
+            if (!$has_more) {
+                update_option('frs_last_sync_time', time());
+                
+                // Update full sync timestamp if this was a full sync
+                $sync_mode = get_option('frs_sync_mode', 'incremental');
+                if ($sync_mode === 'full') {
+                    update_option('frs_last_full_sync_time', time());
+                    // Reset to incremental mode after full sync
+                    update_option('frs_sync_mode', 'incremental');
+                }
+            }
+            
             wp_send_json_success(array(
                 'message' => $result['message'],
                 'progress' => $progress_percent,
@@ -469,6 +597,7 @@ class FRS_API_Sync {
                 'total' => $total_count,
                 'has_more' => $has_more,
                 'next_offset' => $offset + $batch_size,
+                'skipped' => $result['skipped'] ?? 0,
                 'errors' => $result['errors'] ?? 0
             ));
         } else {
@@ -498,7 +627,7 @@ class FRS_API_Sync {
         return $data['total_count'] ?? count($data['agents'] ?? []);
     }
     
-    // Core sync function - batch processing
+    // Core sync function - batch processing with incremental support
     public function fetch_and_sync_loan_officers_batch($offset = 0, $limit = 10) {
         $api_base_url = get_option('frs_api_base_url');
         $api_token = get_option('frs_api_token');
@@ -507,8 +636,22 @@ class FRS_API_Sync {
             return array('success' => false, 'message' => 'API credentials not configured');
         }
         
-        // Fetch loan officers from API with pagination
-        $response = wp_remote_get($api_base_url . '/agents?role=loan_officer&limit=' . $limit . '&offset=' . $offset, array(
+        // Build API request URL with pagination
+        $api_url = $api_base_url . '/agents?role=loan_officer&limit=' . $limit . '&offset=' . $offset;
+        
+        // Add modified_since parameter for incremental sync if available
+        $last_full_sync = get_option('frs_last_full_sync_time');
+        $sync_mode = get_option('frs_sync_mode', 'incremental');
+        
+        if ($sync_mode === 'incremental' && $last_full_sync) {
+            // Only sync records modified since last sync
+            $modified_since = date('Y-m-d\TH:i:s\Z', $last_full_sync);
+            $api_url .= '&modified_since=' . urlencode($modified_since);
+            error_log('FRS Sync: Incremental sync for records modified since ' . $modified_since);
+        }
+        
+        // Fetch loan officers from API
+        $response = wp_remote_get($api_url, array(
             'headers' => array(
                 'X-API-Token' => $api_token
             ),
@@ -533,20 +676,32 @@ class FRS_API_Sync {
         
         $synced = 0;
         $errors = 0;
+        $skipped = 0;
         
         foreach ($data['agents'] as $agent) {
-            if ($this->sync_single_agent($agent)) {
+            $result = $this->sync_single_agent($agent);
+            if ($result === true) {
                 $synced++;
+            } elseif ($result === 'skipped') {
+                $skipped++;
             } else {
                 $errors++;
             }
         }
         
+        // Update last sync timestamp when batch completes successfully
+        if ($errors === 0) {
+            update_option('frs_last_batch_sync_time', time());
+        }
+        
         return array(
             'success' => true, 
-            'message' => "Processed {$synced} loan officers" . ($errors > 0 ? " with {$errors} errors" : ""),
+            'message' => "Processed {$synced} loan officers" . 
+                        ($skipped > 0 ? ", skipped {$skipped} unchanged" : "") .
+                        ($errors > 0 ? ", {$errors} errors" : ""),
             'processed' => count($data['agents']),
             'synced' => $synced,
+            'skipped' => $skipped,
             'errors' => $errors
         );
     }
@@ -588,47 +743,77 @@ class FRS_API_Sync {
         );
     }
     
-    // Sync single agent to Person CPT
+    // Sync single agent to Person CPT with duplicate detection and change tracking
     private function sync_single_agent($agent) {
         if (empty($agent['email'])) {
             return false;
         }
         
-        // Look for existing person by email
-        $existing_posts = get_posts(array(
-            'post_type' => 'person',
-            'meta_query' => array(
-                array(
-                    'key' => 'primary_business_email',
-                    'value' => $agent['email'],
-                    'compare' => '='
-                )
-            ),
-            'posts_per_page' => 1
-        ));
+        // Calculate checksum for this agent data
+        $current_checksum = $this->calculate_agent_checksum($agent);
         
-        $post_data = array(
-            'post_title' => trim($agent['first_name'] . ' ' . $agent['last_name']),
-            'post_type' => 'person',
-            'post_status' => 'publish',
-            'post_content' => $agent['biography'] ?? '',
-        );
+        // Look for existing person by multiple identifiers to prevent duplicates
+        $existing_post = $this->find_existing_person($agent);
         
-        if ($existing_posts) {
-            // Update existing
-            $post_data['ID'] = $existing_posts[0]->ID;
-            $post_id = wp_update_post($post_data);
+        if ($existing_post) {
+            $post_id = $existing_post->ID;
+            
+            // Check if data has actually changed
+            $stored_checksum = get_post_meta($post_id, '_frs_data_checksum', true);
+            $last_modified = $agent['updated_at'] ?? $agent['modified_at'] ?? null;
+            $stored_modified = get_post_meta($post_id, '_frs_last_modified', true);
+            
+            // Skip update if data hasn't changed
+            if ($stored_checksum === $current_checksum) {
+                error_log('FRS Sync: Skipping unchanged record for ' . $agent['email']);
+                return 'skipped';
+            }
+            
+            // Also check if remote modified date is older than our last sync
+            if ($last_modified && $stored_modified && strtotime($last_modified) <= strtotime($stored_modified)) {
+                error_log('FRS Sync: Skipping record with older timestamp for ' . $agent['email']);
+                return 'skipped';
+            }
+            
+            // Update existing record
+            $post_data = array(
+                'ID' => $post_id,
+                'post_title' => trim($agent['first_name'] . ' ' . $agent['last_name']),
+                'post_type' => 'person',
+                'post_status' => 'publish',
+                'post_content' => $agent['biography'] ?? '',
+            );
+            
+            $result = wp_update_post($post_data);
+            if (is_wp_error($result)) {
+                return false;
+            }
+            
+            error_log('FRS Sync: Updated person ' . $agent['email']);
         } else {
-            // Create new
+            // Create new record
+            $post_data = array(
+                'post_title' => trim($agent['first_name'] . ' ' . $agent['last_name']),
+                'post_type' => 'person',
+                'post_status' => 'publish',
+                'post_content' => $agent['biography'] ?? '',
+            );
+            
             $post_id = wp_insert_post($post_data);
-        }
-        
-        if (is_wp_error($post_id) || !$post_id) {
-            return false;
+            if (is_wp_error($post_id) || !$post_id) {
+                return false;
+            }
+            
+            error_log('FRS Sync: Created new person ' . $agent['email']);
         }
         
         // Update ACF fields
         $this->update_person_acf_fields($post_id, $agent);
+        
+        // Store checksum and sync metadata
+        update_post_meta($post_id, '_frs_data_checksum', $current_checksum);
+        update_post_meta($post_id, '_frs_last_sync', current_time('mysql'));
+        update_post_meta($post_id, '_frs_last_modified', $agent['updated_at'] ?? $agent['modified_at'] ?? current_time('mysql'));
         
         // Set taxonomy terms
         if (!empty($agent['role'])) {
@@ -636,6 +821,82 @@ class FRS_API_Sync {
         }
         
         return true;
+    }
+    
+    // Find existing person by multiple identifiers to prevent duplicates
+    private function find_existing_person($agent) {
+        // Build meta query with multiple identifiers
+        $meta_query = array('relation' => 'OR');
+        
+        // Primary check: email
+        if (!empty($agent['email'])) {
+            $meta_query[] = array(
+                'key' => 'primary_business_email',
+                'value' => $agent['email'],
+                'compare' => '='
+            );
+        }
+        
+        // Secondary check: FRS agent ID
+        if (!empty($agent['id'])) {
+            $meta_query[] = array(
+                'key' => '_frs_agent_id',
+                'value' => $agent['id'],
+                'compare' => '='
+            );
+        }
+        
+        // Tertiary check: FRS UUID
+        if (!empty($agent['uuid'])) {
+            $meta_query[] = array(
+                'key' => '_frs_agent_uuid',
+                'value' => $agent['uuid'],
+                'compare' => '='
+            );
+        }
+        
+        // Quaternary check: NMLS number (if unique identifier)
+        if (!empty($agent['nmls_number'])) {
+            $meta_query[] = array(
+                'key' => 'nmls',
+                'value' => $agent['nmls_number'],
+                'compare' => '='
+            );
+        }
+        
+        $existing_posts = get_posts(array(
+            'post_type' => 'person',
+            'meta_query' => $meta_query,
+            'posts_per_page' => 1,
+            'orderby' => 'ID',
+            'order' => 'ASC'
+        ));
+        
+        return $existing_posts ? $existing_posts[0] : null;
+    }
+    
+    // Calculate checksum for agent data to detect changes
+    private function calculate_agent_checksum($agent) {
+        // Include all relevant fields in checksum calculation
+        $checksum_data = array(
+            'first_name' => $agent['first_name'] ?? '',
+            'last_name' => $agent['last_name'] ?? '',
+            'email' => $agent['email'] ?? '',
+            'phone' => $agent['phone'] ?? '',
+            'job_title' => $agent['job_title'] ?? '',
+            'nmls_number' => $agent['nmls_number'] ?? '',
+            'license_number' => $agent['license_number'] ?? '',
+            'biography' => $agent['biography'] ?? '',
+            'specialties_lo' => json_encode($agent['specialties_lo'] ?? []),
+            'languages' => json_encode($agent['languages'] ?? []),
+            'headshot_url' => $agent['headshot_url'] ?? '',
+            'role' => $agent['role'] ?? ''
+        );
+        
+        // Sort keys to ensure consistent checksum
+        ksort($checksum_data);
+        
+        return md5(json_encode($checksum_data));
     }
     
     // Update ACF fields for a person
@@ -661,9 +922,9 @@ class FRS_API_Sync {
             $field_mappings['languages'] = array_map('trim', $languages);
         }
         
-        // Handle headshot image
+        // Handle headshot image with deduplication
         if (!empty($agent['headshot_url'])) {
-            $attachment_id = $this->upload_image_from_url($agent['headshot_url'], $post_id);
+            $attachment_id = $this->get_or_upload_image($agent['headshot_url'], $post_id);
             if ($attachment_id) {
                 $field_mappings['headshot'] = $attachment_id;
             }
@@ -681,23 +942,71 @@ class FRS_API_Sync {
         update_post_meta($post_id, '_frs_agent_uuid', $agent['uuid'] ?? '');
     }
     
-    // Upload image from URL and attach to post
-    private function upload_image_from_url($image_url, $post_id) {
+    // Get existing image or upload new one (prevents duplicates)
+    private function get_or_upload_image($image_url, $post_id) {
         if (empty($image_url)) {
             return false;
         }
         
+        // Generate a unique hash for this image URL
+        $url_hash = md5($image_url);
+        
+        // Check if we've already uploaded this exact image
+        $existing_attachments = get_posts(array(
+            'post_type' => 'attachment',
+            'meta_query' => array(
+                array(
+                    'key' => '_frs_image_url_hash',
+                    'value' => $url_hash,
+                    'compare' => '='
+                )
+            ),
+            'posts_per_page' => 1
+        ));
+        
+        if ($existing_attachments) {
+            // Image already exists, return its ID
+            error_log('FRS Sync: Using existing image for URL ' . $image_url);
+            return $existing_attachments[0]->ID;
+        }
+        
+        // Also check by filename to catch previously uploaded images
+        $filename = basename(parse_url($image_url, PHP_URL_PATH));
+        if ($filename) {
+            $existing_by_name = get_posts(array(
+                'post_type' => 'attachment',
+                'meta_query' => array(
+                    array(
+                        'key' => '_wp_attached_file',
+                        'value' => $filename,
+                        'compare' => 'LIKE'
+                    )
+                ),
+                'posts_per_page' => 1
+            ));
+            
+            if ($existing_by_name) {
+                // Found existing image by filename, update its hash for future lookups
+                update_post_meta($existing_by_name[0]->ID, '_frs_image_url_hash', $url_hash);
+                update_post_meta($existing_by_name[0]->ID, '_frs_original_url', $image_url);
+                error_log('FRS Sync: Found existing image by filename for ' . $filename);
+                return $existing_by_name[0]->ID;
+            }
+        }
+        
+        // Image doesn't exist, upload it
         require_once(ABSPATH . 'wp-admin/includes/media.php');
         require_once(ABSPATH . 'wp-admin/includes/file.php');
         require_once(ABSPATH . 'wp-admin/includes/image.php');
         
         $tmp = download_url($image_url);
         if (is_wp_error($tmp)) {
+            error_log('FRS Sync: Failed to download image from ' . $image_url);
             return false;
         }
         
         $file_array = array(
-            'name' => basename($image_url),
+            'name' => $filename ?: 'headshot-' . $url_hash . '.jpg',
             'tmp_name' => $tmp
         );
         
@@ -705,10 +1014,23 @@ class FRS_API_Sync {
         
         if (is_wp_error($attachment_id)) {
             @unlink($tmp);
+            error_log('FRS Sync: Failed to create attachment for ' . $image_url);
             return false;
         }
         
+        // Store the URL hash and original URL for future deduplication
+        update_post_meta($attachment_id, '_frs_image_url_hash', $url_hash);
+        update_post_meta($attachment_id, '_frs_original_url', $image_url);
+        update_post_meta($attachment_id, '_frs_upload_time', current_time('mysql'));
+        
+        error_log('FRS Sync: Uploaded new image from ' . $image_url);
+        
         return $attachment_id;
+    }
+    
+    // Upload image from URL and attach to post (deprecated - kept for backward compatibility)
+    private function upload_image_from_url($image_url, $post_id) {
+        return $this->get_or_upload_image($image_url, $post_id);
     }
     
     // Link user to person CPT on registration
@@ -1090,16 +1412,96 @@ class FRS_API_Sync {
     public function person_sync_meta_box($post) {
         $frs_agent_id = get_post_meta($post->ID, '_frs_agent_id', true);
         $frs_agent_uuid = get_post_meta($post->ID, '_frs_agent_uuid', true);
+        $data_checksum = get_post_meta($post->ID, '_frs_data_checksum', true);
+        $last_sync = get_post_meta($post->ID, '_frs_last_sync', true);
+        $last_modified = get_post_meta($post->ID, '_frs_last_modified', true);
         $linked_user = get_field('account', $post->ID);
         
         echo '<table class="form-table">';
         echo '<tr><th>FRS Agent ID:</th><td>' . ($frs_agent_id ?: 'Not synced') . '</td></tr>';
         echo '<tr><th>FRS UUID:</th><td>' . ($frs_agent_uuid ?: 'Not synced') . '</td></tr>';
+        echo '<tr><th>Data Checksum:</th><td>' . ($data_checksum ? substr($data_checksum, 0, 8) . '...' : 'None') . '</td></tr>';
+        echo '<tr><th>Last Sync:</th><td>' . ($last_sync ?: 'Never') . '</td></tr>';
+        echo '<tr><th>Last Modified:</th><td>' . ($last_modified ?: 'Unknown') . '</td></tr>';
         echo '<tr><th>Linked User:</th><td>' . ($linked_user ? get_userdata($linked_user['ID'])->user_login : 'None') . '</td></tr>';
         echo '</table>';
         
         if ($frs_agent_id) {
             echo '<p><a href="' . get_option('frs_api_base_url', 'https://base.frs.works') . '" target="_blank" class="button">View in FRS</a></p>';
+        }
+    }
+    
+    // AJAX handler to reset sync timestamp for full sync
+    public function reset_sync_timestamp() {
+        check_ajax_referer('frs_sync_nonce', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+        
+        // Clear the last full sync time to force a complete sync
+        delete_option('frs_last_full_sync_time');
+        update_option('frs_sync_mode', 'full');
+        
+        wp_send_json_success('Sync timestamp reset - next sync will be a full sync');
+    }
+    
+    // AJAX handler to cleanup duplicate photos
+    public function cleanup_duplicate_photos() {
+        check_ajax_referer('frs_sync_nonce', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+        
+        global $wpdb;
+        
+        // Find duplicate image hashes
+        $duplicates = $wpdb->get_results("
+            SELECT meta_value as hash, GROUP_CONCAT(post_id) as post_ids, COUNT(*) as count
+            FROM {$wpdb->postmeta}
+            WHERE meta_key = '_frs_image_url_hash'
+            AND meta_value != ''
+            GROUP BY meta_value
+            HAVING COUNT(*) > 1
+        ");
+        
+        $cleaned = 0;
+        $errors = 0;
+        
+        foreach ($duplicates as $duplicate) {
+            $post_ids = explode(',', $duplicate->post_ids);
+            // Keep the first one, remove the rest
+            $keep_id = array_shift($post_ids);
+            
+            foreach ($post_ids as $remove_id) {
+                // Find all people using this duplicate image
+                $people_using_image = $wpdb->get_col($wpdb->prepare("
+                    SELECT post_id 
+                    FROM {$wpdb->postmeta}
+                    WHERE meta_key = 'headshot'
+                    AND meta_value = %s
+                ", $remove_id));
+                
+                // Update them to use the kept image
+                foreach ($people_using_image as $person_id) {
+                    update_post_meta($person_id, 'headshot', $keep_id);
+                    error_log('FRS Cleanup: Updated person ' . $person_id . ' to use image ' . $keep_id . ' instead of ' . $remove_id);
+                }
+                
+                // Delete the duplicate attachment
+                if (wp_delete_attachment($remove_id, true)) {
+                    $cleaned++;
+                } else {
+                    $errors++;
+                }
+            }
+        }
+        
+        if ($cleaned > 0 || $errors > 0) {
+            wp_send_json_success("Cleaned up {$cleaned} duplicate photos" . ($errors > 0 ? " with {$errors} errors" : ""));
+        } else {
+            wp_send_json_success("No duplicate photos found");
         }
     }
 }
